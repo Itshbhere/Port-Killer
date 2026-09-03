@@ -146,55 +146,65 @@ export default function PortKillerDashboard() {
   // Helper to resolve API endpoint (local agent bridge or relative Next.js backend)
   const getApiUrl = useCallback(
     (path: string) => {
-      // If we are connected via agentUrl, route to agent
+      // If connected to a custom remote/loopback agent
       if (agentUrl && connectionStatus === "connected") {
         return `${agentUrl}${path}`;
       }
-      // If running on localhost or same host
+      // If running on local Next.js server
       return path;
     },
     [agentUrl, connectionStatus]
   );
 
-  // Probe local agent health or local Next.js API
+  // Probe connection to local Next.js API or companion agent
   const probeConnection = useCallback(
     async (targetUrl: string, isInitial = false) => {
-      // Try target agent first (e.g. 127.0.0.1:4999)
-      try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 1200);
-        const res = await fetch(`${targetUrl}/health`, {
-          signal: controller.signal,
-          cache: "no-store",
-        });
-        clearTimeout(timeout);
-        if (res.ok) {
-          const data = await res.json();
-          setConnectionStatus("connected");
-          if (data.system) setSystemInfo(data.system);
-          setIsConnectModalOpen(false);
-          return true;
+      const isLocalHost =
+        typeof window !== "undefined" &&
+        (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
+
+      // 1. If running on localhost/127.0.0.1 without a forced ?agent param, use built-in Next.js API
+      if (isLocalHost && (!targetUrl || targetUrl === DEFAULT_AGENT_URL)) {
+        try {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 1500);
+          const res = await fetch("/api/ports?mode=dev&ports=3000", {
+            signal: controller.signal,
+            cache: "no-store",
+          });
+          clearTimeout(timeout);
+          if (res.ok) {
+            setAgentUrl(""); // Clear agentUrl to use direct relative /api routes
+            setConnectionStatus("connected");
+            setIsConnectModalOpen(false);
+            return true;
+          }
+        } catch {
+          // Local Next.js API failed, fall through to agent probe
         }
-      } catch {
-        // Agent not listening at targetUrl
       }
 
-      // If running directly in local Next.js dev server, check /api/ports
-      try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 1200);
-        const res = await fetch("/api/ports?mode=dev&ports=3000", {
-          signal: controller.signal,
-          cache: "no-store",
-        });
-        clearTimeout(timeout);
-        if (res.ok) {
-          setConnectionStatus("connected");
-          setIsConnectModalOpen(false);
-          return true;
+      // 2. Otherwise probe the companion agent (127.0.0.1:4999 or specified targetUrl)
+      if (targetUrl) {
+        try {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 1200);
+          const res = await fetch(`${targetUrl}/health`, {
+            signal: controller.signal,
+            cache: "no-store",
+          });
+          clearTimeout(timeout);
+          if (res.ok) {
+            const data = await res.json();
+            setAgentUrl(targetUrl);
+            setConnectionStatus("connected");
+            if (data.system) setSystemInfo(data.system);
+            setIsConnectModalOpen(false);
+            return true;
+          }
+        } catch {
+          // Companion agent not running
         }
-      } catch {
-        // Neither connected
       }
 
       setConnectionStatus("disconnected");
@@ -208,13 +218,22 @@ export default function PortKillerDashboard() {
 
   // Check URL params for ?agent=... on mount
   useEffect(() => {
-    let chosenAgent = DEFAULT_AGENT_URL;
+    let chosenAgent = "";
     if (typeof window !== "undefined") {
       const params = new URLSearchParams(window.location.search);
       const paramAgent = params.get("agent");
       if (paramAgent) {
         chosenAgent = paramAgent;
         setAgentUrl(paramAgent);
+      } else {
+        const isLocal =
+          window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1";
+        if (!isLocal) {
+          chosenAgent = DEFAULT_AGENT_URL;
+          setAgentUrl(DEFAULT_AGENT_URL);
+        } else {
+          setAgentUrl("");
+        }
       }
 
       // Load custom dev ports from localStorage
@@ -238,7 +257,7 @@ export default function PortKillerDashboard() {
   useEffect(() => {
     if (isConnectModalOpen && connectionStatus !== "connected") {
       pingTimerRef.current = setInterval(async () => {
-        const ok = await probeConnection(agentUrl, false);
+        const ok = await probeConnection(agentUrl || DEFAULT_AGENT_URL, false);
         if (ok) {
           addToast("success", "Machine Connected!", "Local agent detected. Loading your ports...");
         }
