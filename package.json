@@ -1,12 +1,33 @@
 {
-  "name": "port-killer-app",
-  "version": "0.1.0",
-  "private": true,
+  "name": "port-killer",
+  "version": "1.0.0",
+  "description": "Inspect active local ports, monitor development sockets, and terminate rogue processes with one click.",
+  "bin": {
+    "port-killer": "./bin/cli.js"
+  },
+  "main": "bin/cli.js",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "agent": "node bin/cli.js"
+  },
+  "keywords": [
+    "port-killer",
+    "port",
+    "kill",
+    "lsof",
+    "socket",
+    "eaddrinuse",
+    "process-killer",
+    "developer-tools"
+  ],
+  "author": "Burhan",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Itshbhere/Port-Killer.git"
   },
   "dependencies": {
     "lucide-react": "^1.40.0",

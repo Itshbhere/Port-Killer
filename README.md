@@ -106,13 +106,25 @@ Because Next.js route handlers execute in the Node.js runtime on your host machi
 
 ## 🚀 Getting Started
 
-### Prerequisites
+### Method A: Instant Launch (Zero Install)
 
+Anyone on macOS, Linux, or Windows can launch Port Killer instantly via `npx`:
+
+```bash
+npx port-killer
+```
+
+This starts the lightweight local bridge (`http://127.0.0.1:4999`) on your machine and opens the web dashboard in your browser.
+
+---
+
+### Method B: Run Locally from Source
+
+#### Prerequisites
 - [Node.js](https://nodejs.org/) (v18.17.0 or higher; Node 20+ recommended)
 - `npm`, `pnpm`, `yarn`, or `bun`
 
-### Installation
-
+#### Installation
 1. **Clone the repository:**
    ```bash
    git clone https://github.com/Itshbhere/Port-Killer.git
@@ -131,6 +143,18 @@ Because Next.js route handlers execute in the Node.js runtime on your host machi
 
 4. **Open the dashboard:**
    Navigate to [http://localhost:3000](http://localhost:3000) in your web browser.
+
+---
+
+### Method C: Connecting from a Hosted Web Dashboard
+
+If you host Port Killer as a website (e.g. on Vercel, Netlify, or GitHub Pages):
+1. Any visitor opens your website URL.
+2. If not already running locally, the dashboard automatically prompts them to connect with:
+   ```bash
+   npx port-killer
+   ```
+3. Once run in their terminal, the website auto-detects their local machine and immediately displays their own ports!
 
 ---
 

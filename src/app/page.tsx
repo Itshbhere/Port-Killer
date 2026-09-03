@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useCallback, useMemo } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   Search,
   Zap,
@@ -9,13 +9,11 @@ import {
   CheckCircle2,
   XCircle,
   Terminal,
-  Activity,
   Trash2,
   AlertTriangle,
   Flame,
   ArrowRight,
   ExternalLink,
-  Layers,
   Copy,
   Check,
   Radio,
@@ -24,6 +22,9 @@ import {
   SlidersHorizontal,
   Code2,
   Globe,
+  Laptop,
+  Wifi,
+  WifiOff,
 } from "lucide-react";
 
 interface PortInfo {
@@ -79,11 +80,19 @@ const DEFAULT_DEV_PORTS: DevPortItem[] = [
   { port: 6379, label: "Redis" },
 ];
 
+const DEFAULT_AGENT_URL = "http://127.0.0.1:4999";
+
 export default function PortKillerDashboard() {
+  // Connection state
+  const [agentUrl, setAgentUrl] = useState<string>(DEFAULT_AGENT_URL);
+  const [connectionStatus, setConnectionStatus] = useState<"connected" | "connecting" | "disconnected">("connecting");
+  const [isConnectModalOpen, setIsConnectModalOpen] = useState<boolean>(false);
+  const [hasCopiedCommand, setHasCopiedCommand] = useState<boolean>(false);
+
   // Scan mode: "dev" (default) or "all"
   const [scanMode, setScanMode] = useState<"dev" | "all">("dev");
 
-  // Tracked development ports (initialized from localStorage or default)
+  // Tracked development ports
   const [devPorts, setDevPorts] = useState<DevPortItem[]>(DEFAULT_DEV_PORTS);
   const [devStatusList, setDevStatusList] = useState<DevPortStatus[]>([]);
 
@@ -92,13 +101,13 @@ export default function PortKillerDashboard() {
   const [newPortNumber, setNewPortNumber] = useState("");
   const [newPortLabel, setNewPortLabel] = useState("");
 
-  // All ports & system info (for "all" mode)
+  // All ports & system info
   const [allPorts, setAllPorts] = useState<PortInfo[]>([]);
   const [systemInfo, setSystemInfo] = useState<SystemInfo | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [lastScanned, setLastScanned] = useState<Date | null>(null);
   const [autoRefresh, setAutoRefresh] = useState<boolean>(true);
-  const [refreshInterval, setRefreshInterval] = useState<number>(3500); // 3.5 seconds
+  const [refreshInterval, setRefreshInterval] = useState<number>(3500);
 
   // Single port inspector state
   const [searchPort, setSearchPort] = useState<string>("");
@@ -113,33 +122,136 @@ export default function PortKillerDashboard() {
   // Table filtering & selection for "all" mode
   const [tableFilter, setTableFilter] = useState<string>("");
   const [filterType, setFilterType] = useState<"all" | "user" | "system">("all");
-  const [selectedPids, setSelectedPids] = useState<Set<number>>(new Set());
 
   // Kill action state & modal
   const [killingPid, setKillingPid] = useState<number | null>(null);
   const [killModalTarget, setKillModalTarget] = useState<PortInfo | null>(null);
-  const [batchKillModalOpen, setBatchKillModalOpen] = useState<boolean>(false);
 
   // Toast notifications & copy state
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [copiedPid, setCopiedPid] = useState<number | null>(null);
 
-  // Load custom dev ports from localStorage on mount
-  useEffect(() => {
-    try {
-      const saved = localStorage.getItem("port_killer_dev_ports");
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          setDevPorts(parsed);
-        }
-      }
-    } catch {
-      // Ignore error
-    }
+  // Auto-ping timer ref for connection modal
+  const pingTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Helper to add toast
+  const addToast = useCallback((type: "success" | "error" | "info", title: string, message: string) => {
+    const id = Math.random().toString(36).substring(2, 9);
+    setToasts((prev) => [...prev, { id, type, title, message }]);
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 4500);
   }, []);
 
-  // Save dev ports to localStorage whenever changed
+  // Helper to resolve API endpoint (local agent bridge or relative Next.js backend)
+  const getApiUrl = useCallback(
+    (path: string) => {
+      // If we are connected via agentUrl, route to agent
+      if (agentUrl && connectionStatus === "connected") {
+        return `${agentUrl}${path}`;
+      }
+      // If running on localhost or same host
+      return path;
+    },
+    [agentUrl, connectionStatus]
+  );
+
+  // Probe local agent health or local Next.js API
+  const probeConnection = useCallback(
+    async (targetUrl: string, isInitial = false) => {
+      // Try target agent first (e.g. 127.0.0.1:4999)
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 1200);
+        const res = await fetch(`${targetUrl}/health`, {
+          signal: controller.signal,
+          cache: "no-store",
+        });
+        clearTimeout(timeout);
+        if (res.ok) {
+          const data = await res.json();
+          setConnectionStatus("connected");
+          if (data.system) setSystemInfo(data.system);
+          setIsConnectModalOpen(false);
+          return true;
+        }
+      } catch {
+        // Agent not listening at targetUrl
+      }
+
+      // If running directly in local Next.js dev server, check /api/ports
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 1200);
+        const res = await fetch("/api/ports?mode=dev&ports=3000", {
+          signal: controller.signal,
+          cache: "no-store",
+        });
+        clearTimeout(timeout);
+        if (res.ok) {
+          setConnectionStatus("connected");
+          setIsConnectModalOpen(false);
+          return true;
+        }
+      } catch {
+        // Neither connected
+      }
+
+      setConnectionStatus("disconnected");
+      if (isInitial) {
+        setIsConnectModalOpen(true);
+      }
+      return false;
+    },
+    []
+  );
+
+  // Check URL params for ?agent=... on mount
+  useEffect(() => {
+    let chosenAgent = DEFAULT_AGENT_URL;
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      const paramAgent = params.get("agent");
+      if (paramAgent) {
+        chosenAgent = paramAgent;
+        setAgentUrl(paramAgent);
+      }
+
+      // Load custom dev ports from localStorage
+      try {
+        const saved = localStorage.getItem("port_killer_dev_ports");
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            setDevPorts(parsed);
+          }
+        }
+      } catch {
+        // Ignore
+      }
+    }
+
+    probeConnection(chosenAgent, true);
+  }, [probeConnection]);
+
+  // Periodic ping loop when modal is open to auto-detect when agent starts
+  useEffect(() => {
+    if (isConnectModalOpen && connectionStatus !== "connected") {
+      pingTimerRef.current = setInterval(async () => {
+        const ok = await probeConnection(agentUrl, false);
+        if (ok) {
+          addToast("success", "Machine Connected!", "Local agent detected. Loading your ports...");
+        }
+      }, 1500);
+    } else if (pingTimerRef.current) {
+      clearInterval(pingTimerRef.current);
+    }
+    return () => {
+      if (pingTimerRef.current) clearInterval(pingTimerRef.current);
+    };
+  }, [isConnectModalOpen, connectionStatus, agentUrl, probeConnection, addToast]);
+
+  // Save dev ports to localStorage
   const saveDevPorts = (updated: DevPortItem[]) => {
     setDevPorts(updated);
     try {
@@ -154,7 +266,7 @@ export default function PortKillerDashboard() {
     e.preventDefault();
     const port = parseInt(newPortNumber.trim(), 10);
     if (isNaN(port) || port < 1 || port > 65535) {
-      addToast("error", "Invalid Port", "Port must be a number between 1 and 65535.");
+      addToast("error", "Invalid Port", "Port must be between 1 and 65535.");
       return;
     }
     if (devPorts.some((p) => p.port === port)) {
@@ -184,40 +296,35 @@ export default function PortKillerDashboard() {
     addToast("info", "Port Removed", `Port ${portToRemove} removed from dev list.`);
   };
 
-  // Helper to add toast
-  const addToast = useCallback((type: "success" | "error" | "info", title: string, message: string) => {
-    const id = Math.random().toString(36).substring(2, 9);
-    setToasts((prev) => [...prev, { id, type, title, message }]);
-    setTimeout(() => {
-      setToasts((prev) => prev.filter((t) => t.id !== id));
-    }, 4500);
-  }, []);
-
   // Fetch ports based on current scan mode
   const fetchPorts = useCallback(
     async (isSilent = false) => {
+      if (connectionStatus === "disconnected") return;
       if (!isSilent) setIsLoading(true);
+
       try {
         if (scanMode === "dev") {
           const portsQuery = devPorts.map((p) => p.port).join(",");
-          const res = await fetch(`/api/ports?mode=dev&ports=${portsQuery}`, {
-            cache: "no-store",
-          });
+          const endpoint = getApiUrl(`/api/ports?mode=dev&ports=${portsQuery}`);
+          const res = await fetch(endpoint, { cache: "no-store" });
           const data = await res.json();
           if (data.success) {
             setDevStatusList(data.devStatus || []);
             setAllPorts(data.ports || []);
             if (data.system) setSystemInfo(data.system);
             setLastScanned(new Date());
+            setConnectionStatus("connected");
           }
         } else {
           // Full scan mode
-          const res = await fetch("/api/ports?mode=all", { cache: "no-store" });
+          const endpoint = getApiUrl("/api/ports?mode=all");
+          const res = await fetch(endpoint, { cache: "no-store" });
           const data = await res.json();
           if (data.success) {
             setAllPorts(data.ports || []);
             if (data.system) setSystemInfo(data.system);
             setLastScanned(new Date());
+            setConnectionStatus("connected");
           }
         }
       } catch (err: unknown) {
@@ -229,22 +336,24 @@ export default function PortKillerDashboard() {
         if (!isSilent) setIsLoading(false);
       }
     },
-    [scanMode, devPorts, addToast]
+    [scanMode, devPorts, connectionStatus, getApiUrl, addToast]
   );
 
   // Initial load and refetch on mode or port list change
   useEffect(() => {
-    fetchPorts();
-  }, [fetchPorts]);
+    if (connectionStatus === "connected") {
+      fetchPorts();
+    }
+  }, [fetchPorts, connectionStatus]);
 
   // Auto refresh timer
   useEffect(() => {
-    if (!autoRefresh) return;
+    if (!autoRefresh || connectionStatus !== "connected") return;
     const interval = setInterval(() => {
       fetchPorts(true);
     }, refreshInterval);
     return () => clearInterval(interval);
-  }, [autoRefresh, refreshInterval, fetchPorts]);
+  }, [autoRefresh, refreshInterval, fetchPorts, connectionStatus]);
 
   // Check specific port
   const handleCheckPort = async (portNum?: number) => {
@@ -256,7 +365,8 @@ export default function PortKillerDashboard() {
 
     setIsCheckingPort(true);
     try {
-      const res = await fetch(`/api/ports/${target}`, { cache: "no-store" });
+      const endpoint = getApiUrl(`/api/ports/${target}`);
+      const res = await fetch(endpoint, { cache: "no-store" });
       const data = await res.json();
 
       if (data.success) {
@@ -290,7 +400,8 @@ export default function PortKillerDashboard() {
   const executeKill = async (target: PortInfo) => {
     setKillingPid(target.pid);
     try {
-      const res = await fetch("/api/kill", {
+      const endpoint = getApiUrl("/api/kill");
+      const res = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ pid: target.pid, port: target.port, force: true }),
@@ -299,11 +410,9 @@ export default function PortKillerDashboard() {
 
       if (data.success) {
         addToast("success", "Port Released!", data.message || `Killed PID ${target.pid} on port ${target.port}.`);
-        // If the inspected port was this one, re-check it
         if (inspectedPort && inspectedPort.port === target.port) {
           handleCheckPort(target.port);
         }
-        // Refresh active list immediately
         fetchPorts(true);
       } else {
         addToast("error", "Termination Failed", data.message || "Failed to terminate process.");
@@ -322,6 +431,14 @@ export default function PortKillerDashboard() {
     navigator.clipboard.writeText(text);
     setCopiedPid(pid);
     setTimeout(() => setCopiedPid(null), 1800);
+  };
+
+  // Copy npx command helper
+  const copyNpxCommand = () => {
+    navigator.clipboard.writeText("npx port-killer");
+    setHasCopiedCommand(true);
+    addToast("info", "Command Copied!", "Paste and run 'npx port-killer' in your terminal.");
+    setTimeout(() => setHasCopiedCommand(false), 2500);
   };
 
   // Status mapping for dev ports
@@ -357,7 +474,7 @@ export default function PortKillerDashboard() {
 
   return (
     <div className="min-h-screen text-slate-100 flex flex-col">
-      {/* Toast Floating Alerts */}
+      {/* Toast Alerts */}
       <div className="fixed top-5 right-5 z-50 flex flex-col gap-3 pointer-events-none max-w-sm w-full">
         {toasts.map((t) => (
           <div
@@ -381,7 +498,7 @@ export default function PortKillerDashboard() {
         ))}
       </div>
 
-      {/* Top Navigation */}
+      {/* Top Header */}
       <header className="border-b border-slate-800/80 bg-slate-950/70 backdrop-blur-md sticky top-0 z-30">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -394,29 +511,50 @@ export default function PortKillerDashboard() {
                   PORT // KILLER
                 </span>
                 <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded-full bg-rose-500/10 border border-rose-500/30 text-rose-300">
-                  Next.js Agent
+                  Universal Agent
                 </span>
               </div>
               <p className="text-xs text-slate-400 font-mono hidden sm:block">
-                Dev Socket Inspector & One-Click Port Terminator
+                Web Dashboard for Local Machine Sockets
               </p>
             </div>
           </div>
 
           <div className="flex items-center gap-3">
-            {/* Host pill */}
-            <div className="hidden md:flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-xs font-mono text-slate-300">
-              <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-              <span>{systemInfo ? `${systemInfo.hostname} (${systemInfo.platform})` : "Connected"}</span>
-            </div>
+            {/* Machine Connection Pill Button */}
+            <button
+              onClick={() => setIsConnectModalOpen(true)}
+              className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-mono transition-all cursor-pointer ${
+                connectionStatus === "connected"
+                  ? "bg-emerald-950/40 border-emerald-500/30 text-emerald-300 hover:bg-emerald-900/30"
+                  : "bg-rose-950/50 border-rose-500/40 text-rose-300 hover:bg-rose-900/40 animate-pulse"
+              }`}
+              title="Click to manage local machine connection"
+            >
+              {connectionStatus === "connected" ? (
+                <>
+                  <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                  <span className="hidden md:inline">
+                    {systemInfo?.hostname || "Local Machine"} ({systemInfo?.platform || "Connected"})
+                  </span>
+                  <span className="md:hidden">Connected</span>
+                </>
+              ) : (
+                <>
+                  <WifiOff className="w-3.5 h-3.5 text-rose-400" />
+                  <span>Connect Machine</span>
+                </>
+              )}
+            </button>
 
             {/* Auto refresh button */}
             <button
               onClick={() => setAutoRefresh(!autoRefresh)}
+              disabled={connectionStatus !== "connected"}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-mono transition-colors border ${
-                autoRefresh
-                  ? "bg-emerald-950/40 border-emerald-500/30 text-emerald-300 hover:bg-emerald-900/30"
-                  : "bg-slate-900 border-slate-800 text-slate-400 hover:bg-slate-800"
+                autoRefresh && connectionStatus === "connected"
+                  ? "bg-emerald-950/40 border-emerald-500/30 text-emerald-300 hover:bg-emerald-900/30 cursor-pointer"
+                  : "bg-slate-900 border-slate-800 text-slate-500 cursor-not-allowed"
               }`}
             >
               <Radio className={`w-3.5 h-3.5 ${autoRefresh ? "text-emerald-400 animate-pulse" : "text-slate-500"}`} />
@@ -427,11 +565,11 @@ export default function PortKillerDashboard() {
             {/* Manual refresh button */}
             <button
               onClick={() => fetchPorts(false)}
-              disabled={isLoading}
-              className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 active:scale-95 text-xs font-mono text-slate-200 border border-slate-700 transition-all disabled:opacity-50"
+              disabled={isLoading || connectionStatus !== "connected"}
+              className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 active:scale-95 text-xs font-mono text-slate-200 border border-slate-700 transition-all disabled:opacity-50 cursor-pointer"
             >
               <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? "animate-spin text-rose-400" : ""}`} />
-              <span className="hidden sm:inline">Scan Now</span>
+              <span className="hidden sm:inline">Scan</span>
             </button>
           </div>
         </div>
@@ -439,6 +577,45 @@ export default function PortKillerDashboard() {
 
       {/* Main Container */}
       <main className="flex-1 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 w-full space-y-8">
+        {/* DISCONNECTED HERO BANNER */}
+        {connectionStatus !== "connected" && (
+          <div className="rounded-2xl border-2 border-dashed border-rose-500/40 bg-rose-950/20 p-6 sm:p-8 text-center space-y-4 shadow-xl">
+            <div className="w-12 h-12 rounded-full bg-rose-500/10 border border-rose-500/30 text-rose-400 flex items-center justify-center mx-auto">
+              <Laptop className="w-6 h-6 animate-bounce" />
+            </div>
+            <div>
+              <h2 className="text-xl sm:text-2xl font-bold text-white">Connect Your Local Machine</h2>
+              <p className="text-sm text-slate-400 max-w-lg mx-auto mt-1">
+                To inspect your computer&apos;s ports and terminate rogue processes, run the one-line local agent in your terminal:
+              </p>
+            </div>
+
+            <div className="flex flex-col sm:flex-row items-center justify-center gap-2 max-w-md mx-auto pt-2">
+              <div className="w-full bg-slate-950 px-4 py-3 rounded-xl border border-slate-800 font-mono text-sm text-rose-400 flex items-center justify-between">
+                <span>npx port-killer</span>
+                <button
+                  onClick={copyNpxCommand}
+                  className="text-slate-400 hover:text-white p-1 rounded hover:bg-slate-800 transition-colors cursor-pointer"
+                  title="Copy command"
+                >
+                  {hasCopiedCommand ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4" />}
+                </button>
+              </div>
+              <button
+                onClick={copyNpxCommand}
+                className="w-full sm:w-auto px-5 py-3 bg-rose-600 hover:bg-rose-500 text-white font-mono text-xs font-bold rounded-xl shadow-lg shadow-rose-950/50 shrink-0 cursor-pointer"
+              >
+                Copy Command
+              </button>
+            </div>
+
+            <div className="flex items-center justify-center gap-2 text-xs text-slate-400 font-mono pt-1">
+              <RefreshCw className="w-3.5 h-3.5 animate-spin text-rose-400" />
+              <span>Waiting for local connection at 127.0.0.1:4999...</span>
+            </div>
+          </div>
+        )}
+
         {/* HERO SECTION: Single Port Inspector */}
         <section className="relative rounded-2xl glass-panel p-6 sm:p-8 border border-rose-500/20 shadow-2xl overflow-hidden">
           <div className="absolute top-0 right-0 -mt-16 -mr-16 w-80 h-80 bg-rose-600/10 rounded-full blur-3xl pointer-events-none" />
@@ -454,7 +631,7 @@ export default function PortKillerDashboard() {
               Is your port blocked? Kill it in one click.
             </h1>
             <p className="text-slate-400 text-sm sm:text-base max-w-xl mx-auto">
-              Type any port number below or pick from your development watchlist. If any rogue server is holding it,
+              Type any port number below or check your development watchlist. If any rogue server is holding it,
               terminate it instantly.
             </p>
 
@@ -503,7 +680,6 @@ export default function PortKillerDashboard() {
           {inspectedPort && (
             <div className="mt-8 max-w-2xl mx-auto animate-in fade-in zoom-in-95 duration-200">
               {inspectedPort.inUse && inspectedPort.info ? (
-                /* Occupied Card */
                 <div className="p-6 rounded-2xl bg-gradient-to-b from-rose-950/50 to-slate-900/90 border-2 border-rose-500/50 shadow-2xl glow-danger space-y-5">
                   <div className="flex flex-wrap items-center justify-between gap-3 border-b border-rose-500/20 pb-4">
                     <div className="flex items-center gap-3">
@@ -526,14 +702,13 @@ export default function PortKillerDashboard() {
                     <button
                       onClick={() => handleCheckPort(inspectedPort.port)}
                       disabled={isCheckingPort}
-                      className="text-xs font-mono text-slate-400 hover:text-slate-200 flex items-center gap-1 bg-slate-800/80 px-2.5 py-1 rounded-lg border border-slate-700"
+                      className="text-xs font-mono text-slate-400 hover:text-slate-200 flex items-center gap-1 bg-slate-800/80 px-2.5 py-1 rounded-lg border border-slate-700 cursor-pointer"
                     >
                       <RefreshCw className={`w-3 h-3 ${isCheckingPort ? "animate-spin" : ""}`} />
                       <span>Re-check</span>
                     </button>
                   </div>
 
-                  {/* Process details */}
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                     <div className="bg-slate-900/80 p-3 rounded-xl border border-slate-800">
                       <span className="text-[11px] font-mono text-slate-400 uppercase tracking-wide">
@@ -557,7 +732,7 @@ export default function PortKillerDashboard() {
                         onClick={() =>
                           copyToClipboard(inspectedPort.info!.pid.toString(), inspectedPort.info!.pid)
                         }
-                        className="text-slate-400 hover:text-slate-200 p-1.5 rounded-lg hover:bg-slate-800 transition-colors"
+                        className="text-slate-400 hover:text-slate-200 p-1.5 rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
                         title="Copy PID"
                       >
                         {copiedPid === inspectedPort.info.pid ? (
@@ -578,7 +753,6 @@ export default function PortKillerDashboard() {
                     </div>
                   </div>
 
-                  {/* Command preview */}
                   {inspectedPort.info.command && (
                     <div className="bg-slate-950/80 p-3.5 rounded-xl border border-slate-800/80 space-y-1">
                       <div className="flex items-center gap-1.5 text-xs text-slate-400 font-mono">
@@ -591,7 +765,6 @@ export default function PortKillerDashboard() {
                     </div>
                   )}
 
-                  {/* ONE-CLICK KILL BUTTON */}
                   <div className="pt-2">
                     <button
                       onClick={() => setKillModalTarget(inspectedPort.info!)}
@@ -609,7 +782,6 @@ export default function PortKillerDashboard() {
                   </div>
                 </div>
               ) : (
-                /* Free Card */
                 <div className="p-6 rounded-2xl bg-gradient-to-b from-emerald-950/40 to-slate-900/90 border-2 border-emerald-500/40 shadow-2xl glow-success space-y-3 text-center">
                   <div className="w-12 h-12 rounded-full bg-emerald-500/20 border border-emerald-500/40 text-emerald-400 flex items-center justify-center mx-auto">
                     <CheckCircle2 className="w-7 h-7" />
@@ -654,7 +826,6 @@ export default function PortKillerDashboard() {
               </p>
             </div>
 
-            {/* Mode Switcher Tabs */}
             <div className="bg-slate-900 p-1 rounded-xl border border-slate-800 flex items-center gap-1 self-start sm:self-auto">
               <button
                 onClick={() => setScanMode("dev")}
@@ -690,7 +861,7 @@ export default function PortKillerDashboard() {
             </div>
           </div>
 
-          {/* VIEW 1: DEVELOPMENT PORTS ONLY (FOCUSED & CUSTOMIZABLE) */}
+          {/* VIEW 1: DEV PORTS ONLY */}
           {scanMode === "dev" ? (
             <div className="space-y-4">
               <div className="flex items-center justify-between">
@@ -707,7 +878,7 @@ export default function PortKillerDashboard() {
                 </button>
               </div>
 
-              {/* Add Custom Port Dropdown Panel */}
+              {/* Add Custom Port Panel */}
               {showAddPort && (
                 <form
                   onSubmit={handleAddDevPort}
@@ -772,7 +943,6 @@ export default function PortKillerDashboard() {
                       }`}
                     >
                       <div>
-                        {/* Header: Port number & Status Pill */}
                         <div className="flex items-center justify-between">
                           <div className="flex items-center gap-2">
                             <span className="font-mono text-2xl font-extrabold text-white">
@@ -796,7 +966,6 @@ export default function PortKillerDashboard() {
                               </span>
                             )}
 
-                            {/* Remove button for custom or any port */}
                             {devPorts.length > 1 && (
                               <button
                                 onClick={() => handleRemoveDevPort(devItem.port)}
@@ -809,7 +978,6 @@ export default function PortKillerDashboard() {
                           </div>
                         </div>
 
-                        {/* Process Info if Occupied */}
                         {isOccupied && info ? (
                           <div className="mt-3 p-2.5 rounded-lg bg-slate-950/70 border border-slate-800 text-xs font-mono space-y-1">
                             <div className="flex justify-between items-center">
@@ -846,7 +1014,6 @@ export default function PortKillerDashboard() {
                         )}
                       </div>
 
-                      {/* Action buttons on card */}
                       <div className="mt-4 pt-3 border-t border-slate-800/60 flex items-center gap-2">
                         {isOccupied && info ? (
                           <button
@@ -888,7 +1055,6 @@ export default function PortKillerDashboard() {
             /* VIEW 2: ALL MACHINE PORTS TABLE */
             <div className="space-y-4">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                {/* Search Bar */}
                 <div className="relative flex-1">
                   <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500" />
                   <input
@@ -900,7 +1066,6 @@ export default function PortKillerDashboard() {
                   />
                 </div>
 
-                {/* Filter Tabs */}
                 <div className="bg-slate-900 border border-slate-800 rounded-lg p-0.5 flex text-xs font-mono">
                   <button
                     onClick={() => setFilterType("all")}
@@ -933,7 +1098,6 @@ export default function PortKillerDashboard() {
                 </div>
               </div>
 
-              {/* Table */}
               <div className="rounded-xl border border-slate-800/90 overflow-hidden bg-slate-950/60 backdrop-blur-sm shadow-xl">
                 <div className="overflow-x-auto">
                   <table className="w-full text-left border-collapse">
@@ -974,7 +1138,6 @@ export default function PortKillerDashboard() {
                               key={`${item.port}-${item.pid}`}
                               className="group transition-colors hover:bg-slate-900/60"
                             >
-                              {/* Port */}
                               <td className="py-3.5 px-4">
                                 <button
                                   onClick={() => {
@@ -989,7 +1152,6 @@ export default function PortKillerDashboard() {
                                 </button>
                               </td>
 
-                              {/* Process Name */}
                               <td className="py-3.5 px-4">
                                 <div className="flex items-center gap-2">
                                   <span className="font-semibold text-slate-200">{item.process}</span>
@@ -1001,7 +1163,6 @@ export default function PortKillerDashboard() {
                                 </div>
                               </td>
 
-                              {/* PID */}
                               <td className="py-3.5 px-4">
                                 <button
                                   onClick={() => copyToClipboard(item.pid.toString(), item.pid)}
@@ -1017,16 +1178,13 @@ export default function PortKillerDashboard() {
                                 </button>
                               </td>
 
-                              {/* User */}
                               <td className="py-3.5 px-4 text-slate-400">{item.user || "—"}</td>
 
-                              {/* Protocol */}
                               <td className="py-3.5 px-4 text-slate-400">
                                 <span>{item.address || "*"}</span>{" "}
                                 <span className="text-[10px] text-slate-500">({item.protocol})</span>
                               </td>
 
-                              {/* Command */}
                               <td
                                 className="py-3.5 px-4 text-slate-500 max-w-xs truncate hidden md:table-cell"
                                 title={item.command}
@@ -1034,7 +1192,6 @@ export default function PortKillerDashboard() {
                                 {item.command || item.process}
                               </td>
 
-                              {/* Action */}
                               <td className="py-3.5 px-4 text-right">
                                 <button
                                   onClick={() => setKillModalTarget(item)}
@@ -1072,15 +1229,104 @@ export default function PortKillerDashboard() {
       <footer className="border-t border-slate-800/80 bg-slate-950/80 mt-12 py-6 text-center text-xs font-mono text-slate-500">
         <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-2">
           <div>
-            <span>Port Killer Web Dashboard • Built with Next.js App Router</span>
+            <span>Port Killer Web Dashboard • Connect via <code>npx port-killer</code></span>
           </div>
           <div className="flex items-center gap-3">
-            <span>Platform: {systemInfo?.platform || "macOS"}</span>
+            <span>Platform: {systemInfo?.platform || "Local"}</span>
             <span>•</span>
-            <span>Arch: {systemInfo?.arch || "arm64"}</span>
+            <span>Arch: {systemInfo?.arch || "Host"}</span>
           </div>
         </div>
       </footer>
+
+      {/* CONNECT LOCAL MACHINE MODAL */}
+      {isConnectModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-in fade-in">
+          <div className="bg-slate-900 border border-slate-700/80 rounded-2xl max-w-lg w-full p-6 sm:p-8 shadow-2xl space-y-6 relative">
+            <button
+              onClick={() => setIsConnectModalOpen(false)}
+              className="absolute top-4 right-4 text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
+            >
+              <X className="w-5 h-5" />
+            </button>
+
+            <div className="text-center space-y-2">
+              <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-rose-500 to-red-700 text-white flex items-center justify-center mx-auto shadow-lg shadow-rose-950/60">
+                <Laptop className="w-7 h-7" />
+              </div>
+              <h3 className="text-xl font-bold text-white">Connect Your Local Machine</h3>
+              <p className="text-xs text-slate-400 max-w-md mx-auto">
+                Due to browser security sandboxing, websites cannot scan your local sockets directly.
+                Run the local companion agent in your terminal to inspect and kill your ports.
+              </p>
+            </div>
+
+            {/* Instruction Box */}
+            <div className="bg-slate-950 p-4 rounded-xl border border-slate-800 space-y-3 font-mono text-xs">
+              <div className="flex items-center justify-between text-slate-400">
+                <span>Run in your terminal:</span>
+                <span className="text-[10px] text-emerald-400">Zero install needed</span>
+              </div>
+
+              <div className="bg-slate-900 p-3 rounded-lg border border-slate-800 flex items-center justify-between text-rose-300 font-semibold text-sm">
+                <span>npx port-killer</span>
+                <button
+                  onClick={copyNpxCommand}
+                  className="text-slate-400 hover:text-white p-1.5 rounded hover:bg-slate-800 transition-colors cursor-pointer"
+                  title="Copy command"
+                >
+                  {hasCopiedCommand ? (
+                    <Check className="w-4 h-4 text-emerald-400" />
+                  ) : (
+                    <Copy className="w-4 h-4" />
+                  )}
+                </button>
+              </div>
+
+              <p className="text-[11px] text-slate-500">
+                This starts a local loopback server on <code>127.0.0.1:4999</code> with CORS enabled for this dashboard.
+              </p>
+            </div>
+
+            {/* Status Radar */}
+            <div className="p-4 rounded-xl bg-slate-950/60 border border-slate-800/80 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="relative">
+                  <div className="w-3.5 h-3.5 rounded-full bg-rose-500 animate-radar" />
+                </div>
+                <div>
+                  <h4 className="text-xs font-semibold text-white">Listening for Local Agent...</h4>
+                  <p className="text-[11px] text-slate-400 font-mono mt-0.5">Target: {agentUrl}</p>
+                </div>
+              </div>
+
+              <button
+                onClick={() => probeConnection(agentUrl, false)}
+                className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-xs font-mono flex items-center gap-1.5 cursor-pointer"
+              >
+                <RefreshCw className="w-3 h-3 text-rose-400" />
+                <span>Retry</span>
+              </button>
+            </div>
+
+            <div className="flex items-center gap-3 pt-2">
+              <button
+                onClick={() => setIsConnectModalOpen(false)}
+                className="w-full py-2.5 px-4 bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium text-xs rounded-xl border border-slate-700 transition-colors cursor-pointer"
+              >
+                Continue Offline
+              </button>
+              <button
+                onClick={copyNpxCommand}
+                className="w-full py-2.5 px-4 bg-gradient-to-r from-rose-600 to-red-600 hover:from-rose-500 hover:to-red-500 text-white font-bold text-xs rounded-xl shadow-lg shadow-rose-950/60 transition-all flex items-center justify-center gap-1.5 cursor-pointer"
+              >
+                <Copy className="w-3.5 h-3.5" />
+                <span>{hasCopiedCommand ? "Copied!" : "Copy npx Command"}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* KILL CONFIRMATION MODAL */}
       {killModalTarget && (
